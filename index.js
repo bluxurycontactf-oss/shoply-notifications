@@ -15,6 +15,7 @@ const messaging = admin.messaging();
 const FEDAPAY_SECRET_KEY = process.env.FEDAPAY_SECRET_KEY;
 const FEDAPAY_API_BASE = 'https://api.fedapay.com/v1';
 const PLAN_PRICES = { premium: 4900, business: 14900 };
+const AFFILIATE_RATE = 0.05;
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -167,6 +168,106 @@ app.post('/process-referral', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('process-referral error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// POST /create-paid-order
+// Body: { shopId, items, customerName, customerPhone, customerAddress, customerEmail?,
+//         notes?, subtotal, deliveryFee, fedapayFee, total, transactionId,
+//         affiliateUid? }
+// Plan Gratuit uniquement : le client paie via FedaPay (escrow Shoply). La
+// commande n'est créée qu'après vérification de la transaction côté FedaPay,
+// ce qui empêche un client de fabriquer une commande "payée" sans payer.
+app.post('/create-paid-order', async (req, res) => {
+  const {
+    shopId, items, customerName, customerPhone, customerAddress, customerEmail, notes,
+    subtotal, deliveryFee, fedapayFee, total, transactionId, affiliateUid,
+  } = req.body;
+
+  if (!shopId || !Array.isArray(items) || !items.length || !transactionId
+    || !customerName || !customerPhone
+    || typeof subtotal !== 'number' || typeof fedapayFee !== 'number' || typeof total !== 'number') {
+    return res.status(400).json({ error: 'Paramètres invalides' });
+  }
+
+  try {
+    const shopRef = db.collection('shops').doc(shopId);
+    const shopSnap = await shopRef.get();
+    if (!shopSnap.exists) return res.status(404).json({ error: 'Boutique introuvable' });
+    const shop = shopSnap.data();
+    if (shop.plan !== 'free') {
+      return res.status(400).json({ error: 'Le paiement FedaPay à la commande est réservé au plan Gratuit' });
+    }
+
+    // Empêche de réutiliser la même transaction FedaPay pour plusieurs commandes
+    const existing = await db.collection('orders')
+      .where('fedapayTransactionId', '==', String(transactionId))
+      .limit(1).get();
+    if (!existing.empty) {
+      return res.status(409).json({ error: 'Transaction déjà utilisée' });
+    }
+
+    // Vérifie la transaction directement auprès de FedaPay
+    const fpRes = await fetch(`${FEDAPAY_API_BASE}/transactions/${transactionId}`, {
+      headers: { Authorization: `Bearer ${FEDAPAY_SECRET_KEY}` },
+    });
+    if (!fpRes.ok) return res.status(400).json({ error: 'Transaction FedaPay introuvable' });
+    const fpData = await fpRes.json();
+    const tx = fpData['v1/transaction'] || fpData.transaction || fpData;
+
+    if (tx.status !== 'approved') {
+      return res.status(400).json({ error: 'Paiement non confirmé' });
+    }
+    if (Number(tx.amount) !== Math.round(total)) {
+      return res.status(400).json({ error: 'Montant incorrect' });
+    }
+    if (tx.currency?.iso && tx.currency.iso !== 'XOF') {
+      return res.status(400).json({ error: 'Devise incorrecte' });
+    }
+
+    const vendorPayoutAmount = Math.round(subtotal + (deliveryFee || 0));
+    const now = new Date().toISOString();
+
+    const orderRef = db.collection('orders').doc();
+    const orderData = {
+      id: orderRef.id,
+      shopId,
+      customerName,
+      customerPhone,
+      customerAddress: customerAddress || '',
+      customerEmail: customerEmail || '',
+      items,
+      subtotal,
+      deliveryFee: deliveryFee || 0,
+      total,
+      currency: 'XOF',
+      paymentMethod: 'fedapay',
+      paymentStatus: 'paid',
+      paymentReceived: true,
+      paymentReceivedAt: now,
+      status: 'pending',
+      notes: notes || '',
+      fedapayTransactionId: String(transactionId),
+      fedapayFee,
+      vendorPayoutAmount,
+      vendorPayoutPaid: false,
+      deliveryStatus: 'awaiting_assignment',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Commission affilié recalculée côté serveur (anti-fraude)
+    if (affiliateUid && affiliateUid !== shop.ownerId) {
+      orderData.affiliateUid = affiliateUid;
+      orderData.affiliateCommission = Math.round(vendorPayoutAmount * AFFILIATE_RATE);
+    }
+
+    await orderRef.set(orderData);
+
+    res.json({ success: true, orderId: orderRef.id });
+  } catch (err) {
+    console.error('create-paid-order error:', err);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
