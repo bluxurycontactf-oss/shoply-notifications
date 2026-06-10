@@ -369,5 +369,54 @@ app.post('/notify-new-product', async (req, res) => {
   }
 });
 
+// POST /resend-delivery-notification
+// Body: { orderId } — Admin uniquement. Renvoie une notification push au
+// livreur assigné pour le relancer sur une livraison en cours.
+app.post('/resend-delivery-notification', async (req, res) => {
+  const decoded = await verifyIdToken(req);
+  if (!decoded || decoded.email !== 'didilolade@gmail.com') {
+    return res.status(403).json({ error: 'Non autorisé' });
+  }
+
+  const { orderId } = req.body;
+  if (!orderId) return res.status(400).json({ error: 'orderId requis' });
+
+  try {
+    const orderSnap = await db.collection('orders').doc(orderId).get();
+    if (!orderSnap.exists) return res.status(404).json({ error: 'Commande introuvable' });
+    const order = orderSnap.data();
+
+    if (!order.deliveryAgentId) return res.status(400).json({ error: 'Aucun livreur assigné à cette commande' });
+
+    const agentSnap = await db.collection('deliveryAgents').doc(order.deliveryAgentId).get();
+    if (!agentSnap.exists || !agentSnap.data().fcmToken) {
+      return res.status(400).json({ error: 'Le livreur n\'a pas activé les notifications' });
+    }
+
+    const agent = agentSnap.data();
+    const itemsSummary = (order.items || []).map(it => `${it.productName} x${it.quantity}`).join(', ');
+
+    await messaging.send({
+      token: agent.fcmToken,
+      notification: {
+        title: '🔔 Rappel : livraison en attente',
+        body: `${order.customerName} — ${order.customerAddress || order.customerPhone} — ${itemsSummary}`,
+      },
+      data: {
+        orderId,
+        url: 'https://myshoply.web.app/livreur',
+      },
+      webpush: {
+        fcmOptions: { link: 'https://myshoply.web.app/livreur' },
+      },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('resend-delivery-notification error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Shoply Notifications running on port ${PORT}`));
