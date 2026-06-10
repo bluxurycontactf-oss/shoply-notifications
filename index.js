@@ -263,7 +263,44 @@ app.post('/create-paid-order', async (req, res) => {
       orderData.affiliateCommission = Math.round(vendorPayoutAmount * AFFILIATE_RATE);
     }
 
+    // Assigne automatiquement le service de livraison Shoply (livreur actif)
+    // et lui envoie une notification automatique avec les infos de livraison.
+    const agentsSnap = await db.collection('deliveryAgents').where('active', '==', true).get();
+    const activeAgents = agentsSnap.docs.map(d => d.data())
+      .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
+    const agent = activeAgents[0];
+
+    if (agent) {
+      orderData.deliveryAgentId = agent.email;
+      orderData.deliveryAgentName = agent.name;
+      orderData.deliveryStatus = 'assigned';
+    }
+
     await orderRef.set(orderData);
+
+    if (agent) {
+      if (agent.fcmToken) {
+        const itemsSummary = items.map(it => `${it.productName} x${it.quantity}`).join(', ');
+        try {
+          await messaging.send({
+            token: agent.fcmToken,
+            notification: {
+              title: '🚚 Nouvelle livraison à effectuer',
+              body: `${customerName} — ${customerAddress || customerPhone} — ${itemsSummary}`,
+            },
+            data: {
+              orderId: orderRef.id,
+              url: 'https://myshoply.web.app/livreur',
+            },
+            webpush: {
+              fcmOptions: { link: 'https://myshoply.web.app/livreur' },
+            },
+          });
+        } catch (err) {
+          console.error('FCM notify delivery agent error:', err.message);
+        }
+      }
+    }
 
     res.json({ success: true, orderId: orderRef.id });
   } catch (err) {
