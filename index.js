@@ -309,6 +309,53 @@ app.post('/create-paid-order', async (req, res) => {
   }
 });
 
+// Envoie une notification push à tous les abonnés d'une boutique.
+async function notifyShopSubscribers(shopId, productId, title, body) {
+  const snap = await db.collection('subscriptions')
+    .where('shopId', '==', shopId)
+    .get();
+
+  if (snap.empty) return { sent: 0, total: 0 };
+
+  const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
+  if (!tokens.length) return { sent: 0, total: 0 };
+
+  // Send FCM multicast (max 500 per call)
+  const chunks = [];
+  for (let i = 0; i < tokens.length; i += 500) chunks.push(tokens.slice(i, i + 500));
+
+  let sent = 0;
+  for (const chunk of chunks) {
+    const response = await messaging.sendEachForMulticast({
+      tokens: chunk,
+      notification: { title, body },
+      data: {
+        shopId,
+        productId: productId || '',
+        url: `https://myshoply.web.app/shop/${shopId}`,
+      },
+      webpush: {
+        fcmOptions: {
+          link: `https://myshoply.web.app/shop/${shopId}`,
+        },
+      },
+    });
+    sent += response.successCount;
+
+    // Clean up invalid tokens
+    response.responses.forEach((r, idx) => {
+      if (!r.success && (r.error?.code === 'messaging/invalid-registration-token' || r.error?.code === 'messaging/registration-token-not-registered')) {
+        const token = chunk[idx];
+        db.collection('subscriptions').where('fcmToken', '==', token).get()
+          .then(s => s.docs.forEach(d => d.ref.delete()))
+          .catch(() => {});
+      }
+    });
+  }
+
+  return { sent, total: tokens.length };
+}
+
 // POST /notify-new-product
 // Body: { shopId, shopName, productName, productId }
 app.post('/notify-new-product', async (req, res) => {
@@ -316,53 +363,24 @@ app.post('/notify-new-product', async (req, res) => {
   if (!shopId || !productName) return res.status(400).json({ error: 'shopId and productName required' });
 
   try {
-    // Get all subscribers for this shop
-    const snap = await db.collection('subscriptions')
-      .where('shopId', '==', shopId)
-      .get();
+    const result = await notifyShopSubscribers(shopId, productId, `🛍️ Nouveau produit chez ${shopName}`, productName);
+    res.json(result);
+  } catch (err) {
+    console.error('Notification error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
 
-    if (snap.empty) return res.json({ sent: 0 });
+// POST /notify-restock
+// Body: { shopId, shopName, productName, productId } — un produit
+// précédemment épuisé (stock 0) redevient disponible.
+app.post('/notify-restock', async (req, res) => {
+  const { shopId, shopName, productName, productId } = req.body;
+  if (!shopId || !productName) return res.status(400).json({ error: 'shopId and productName required' });
 
-    const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
-    if (!tokens.length) return res.json({ sent: 0 });
-
-    // Send FCM multicast (max 500 per call)
-    const chunks = [];
-    for (let i = 0; i < tokens.length; i += 500) chunks.push(tokens.slice(i, i + 500));
-
-    let sent = 0;
-    for (const chunk of chunks) {
-      const response = await messaging.sendEachForMulticast({
-        tokens: chunk,
-        notification: {
-          title: `🛍️ Nouveau produit chez ${shopName}`,
-          body: productName,
-        },
-        data: {
-          shopId,
-          productId: productId || '',
-          url: `https://myshoply.web.app/shop/${shopId}`,
-        },
-        webpush: {
-          fcmOptions: {
-            link: `https://myshoply.web.app/shop/${shopId}`,
-          },
-        },
-      });
-      sent += response.successCount;
-
-      // Clean up invalid tokens
-      response.responses.forEach((r, idx) => {
-        if (!r.success && (r.error?.code === 'messaging/invalid-registration-token' || r.error?.code === 'messaging/registration-token-not-registered')) {
-          const token = chunk[idx];
-          db.collection('subscriptions').where('fcmToken', '==', token).get()
-            .then(s => s.docs.forEach(d => d.ref.delete()))
-            .catch(() => {});
-        }
-      });
-    }
-
-    res.json({ sent, total: tokens.length });
+  try {
+    const result = await notifyShopSubscribers(shopId, productId, `✅ De retour en stock chez ${shopName}`, productName);
+    res.json(result);
   } catch (err) {
     console.error('Notification error:', err);
     res.status(500).json({ error: String(err) });
