@@ -14,7 +14,7 @@ const messaging = admin.messaging();
 
 const FEDAPAY_SECRET_KEY = process.env.FEDAPAY_SECRET_KEY;
 const FEDAPAY_API_BASE = 'https://api.fedapay.com/v1';
-const PLAN_PRICES = { premium: 4900, business: 14900 };
+const PLAN_PRICES = { premium: 900, business: 4900 };
 const AFFILIATE_RATE = 0.05;
 
 const app = express();
