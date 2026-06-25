@@ -428,6 +428,9 @@ app.post('/create-paid-order', async (req, res) => {
     // Décrémente le stock de chaque produit en même temps que la création de
     // la commande (transaction), pour rester cohérent avec le flux client
     // (lib/firestore.ts createOrder) — le stock ne descend jamais sous 0.
+    // Au passage, repère les produits qui viennent de passer sous le seuil
+    // d'alerte (≤ 3) pour notifier le vendeur juste après.
+    const lowStockAlerts = [];
     await db.runTransaction(async (tx) => {
       const productRefs = items.map(it => db.collection('products').doc(it.productId));
       const productSnaps = await Promise.all(productRefs.map(r => tx.get(r)));
@@ -436,9 +439,30 @@ app.post('/create-paid-order', async (req, res) => {
         const currentStock = snap.data().stock ?? 0;
         const nextStock = Math.max(0, currentStock - items[i].quantity);
         tx.update(productRefs[i], { stock: nextStock, updatedAt: now });
+        if (currentStock > 3 && nextStock <= 3) {
+          lowStockAlerts.push({ productName: items[i].productName, stock: nextStock });
+        }
       });
       tx.set(orderRef, orderData);
     });
+
+    if (shop.ownerFcmToken && lowStockAlerts.length > 0) {
+      for (const alert of lowStockAlerts) {
+        try {
+          await messaging.send({
+            token: shop.ownerFcmToken,
+            notification: {
+              title: `⚠️ Stock bas — ${shop.name}`,
+              body: `${alert.productName} : plus que ${alert.stock} en stock.`,
+            },
+            data: { url: 'https://myshoply.web.app/dashboard/products' },
+            webpush: { fcmOptions: { link: 'https://myshoply.web.app/dashboard/products' } },
+          });
+        } catch (err) {
+          console.error('FCM low-stock alert error:', err.message);
+        }
+      }
+    }
 
     if (agent) {
       if (agent.fcmToken) {
@@ -545,6 +569,38 @@ app.post('/notify-restock', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('Notification error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /notify-low-stock
+// Body: { shopId, productId?, productName, stock } — un produit vient de
+// passer sous le seuil d'alerte (≤ 3 unités) suite à une commande créée
+// côté client (lib/firestore.ts createOrder). Notifie le PROPRIÉTAIRE via
+// son propre token FCM (Shop.ownerFcmToken) — pas les abonnés clients.
+app.post('/notify-low-stock', async (req, res) => {
+  const { shopId, productId, productName, stock } = req.body;
+  if (!shopId || !productName) return res.status(400).json({ error: 'shopId and productName required' });
+
+  try {
+    const shopSnap = await db.collection('shops').doc(shopId).get();
+    if (!shopSnap.exists) return res.status(404).json({ error: 'Boutique introuvable' });
+    const shop = shopSnap.data();
+    if (!shop.ownerFcmToken) return res.json({ success: false, reason: 'no_token' });
+
+    await messaging.send({
+      token: shop.ownerFcmToken,
+      notification: {
+        title: `⚠️ Stock bas — ${shop.name}`,
+        body: `${productName} : plus que ${stock} en stock.`,
+      },
+      data: { productId: productId || '', url: 'https://myshoply.web.app/dashboard/products' },
+      webpush: { fcmOptions: { link: 'https://myshoply.web.app/dashboard/products' } },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('notify-low-stock error:', err);
     res.status(500).json({ error: String(err) });
   }
 });
