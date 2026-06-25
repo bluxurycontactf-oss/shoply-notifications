@@ -236,6 +236,90 @@ app.post('/process-referral', async (req, res) => {
   }
 });
 
+// POST /add-staff
+// Body: { shopId, staffEmail } — Auth: Bearer <ownerIdToken>
+// Donne accès au dashboard de la boutique à un compte Shoply existant
+// (recherché par email via Admin SDK). Réservé au propriétaire. La personne
+// ajoutée doit déjà avoir un compte Shoply — pas d'envoi d'email d'invitation.
+app.post('/add-staff', async (req, res) => {
+  const decoded = await verifyIdToken(req);
+  if (!decoded) return res.status(401).json({ error: 'Non authentifié' });
+
+  const { shopId, staffEmail } = req.body;
+  if (!shopId || !staffEmail) return res.status(400).json({ error: 'Paramètres invalides' });
+
+  try {
+    const shopRef = db.collection('shops').doc(shopId);
+    const shopSnap = await shopRef.get();
+    if (!shopSnap.exists) return res.status(404).json({ error: 'Boutique introuvable' });
+    const shop = shopSnap.data();
+    if (shop.ownerId !== decoded.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut ajouter un employé' });
+    }
+
+    const currentStaff = shop.staffUids || [];
+    if (currentStaff.length >= 15) {
+      return res.status(400).json({ error: 'Limite de 15 employés atteinte' });
+    }
+
+    let staffUser;
+    try {
+      staffUser = await admin.auth().getUserByEmail(String(staffEmail).trim());
+    } catch {
+      return res.status(404).json({ error: 'Aucun compte Shoply trouvé avec cet email. La personne doit déjà avoir un compte.' });
+    }
+
+    if (staffUser.uid === shop.ownerId) {
+      return res.status(400).json({ error: 'C\'est déjà le propriétaire de la boutique' });
+    }
+    if (currentStaff.includes(staffUser.uid)) {
+      return res.status(409).json({ error: 'Cette personne a déjà accès à la boutique' });
+    }
+
+    await shopRef.update({
+      staffUids: admin.firestore.FieldValue.arrayUnion(staffUser.uid),
+      [`staffEmails.${staffUser.uid}`]: staffUser.email,
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('add-staff error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// POST /remove-staff
+// Body: { shopId, staffUid } — Auth: Bearer <ownerIdToken>
+app.post('/remove-staff', async (req, res) => {
+  const decoded = await verifyIdToken(req);
+  if (!decoded) return res.status(401).json({ error: 'Non authentifié' });
+
+  const { shopId, staffUid } = req.body;
+  if (!shopId || !staffUid) return res.status(400).json({ error: 'Paramètres invalides' });
+
+  try {
+    const shopRef = db.collection('shops').doc(shopId);
+    const shopSnap = await shopRef.get();
+    if (!shopSnap.exists) return res.status(404).json({ error: 'Boutique introuvable' });
+    const shop = shopSnap.data();
+    if (shop.ownerId !== decoded.uid) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut retirer un employé' });
+    }
+
+    await shopRef.update({
+      staffUids: admin.firestore.FieldValue.arrayRemove(staffUid),
+      [`staffEmails.${staffUid}`]: admin.firestore.FieldValue.delete(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('remove-staff error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // POST /create-paid-order
 // Body: { shopId, items, customerName, customerPhone, customerAddress, customerEmail?,
 //         notes?, subtotal, deliveryFee, fedapayFee, total, transactionId,
@@ -246,7 +330,7 @@ app.post('/process-referral', async (req, res) => {
 app.post('/create-paid-order', async (req, res) => {
   const {
     shopId, items, customerName, customerPhone, customerAddress, customerEmail, notes,
-    subtotal, deliveryFee, fedapayFee, total, transactionId, affiliateUid,
+    subtotal, deliveryFee, deliveryZone, fedapayFee, total, transactionId, affiliateUid,
   } = req.body;
 
   if (!shopId || !Array.isArray(items) || !items.length || !transactionId
@@ -304,6 +388,7 @@ app.post('/create-paid-order', async (req, res) => {
       items,
       subtotal,
       deliveryFee: deliveryFee || 0,
+      deliveryZone: deliveryZone || null,
       total,
       currency: 'XOF',
       paymentMethod: 'fedapay',
