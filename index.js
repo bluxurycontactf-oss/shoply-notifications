@@ -16,6 +16,21 @@ const FEDAPAY_SECRET_KEY = process.env.FEDAPAY_SECRET_KEY;
 const FEDAPAY_API_BASE = 'https://api.fedapay.com/v1';
 const PLAN_PRICES = { premium: 900, business: 4900 };
 const AFFILIATE_RATE = 0.05;
+const SITE_BASE_URL = 'https://myshoply.web.app';
+
+// Reproduit lib/slug.ts (frontend) pour générer les mêmes URLs /product/[slug]/
+function slugify(text) {
+  return String(text)
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+function getProductSlug(product) {
+  return `${slugify(product.name)}-${product.id}`;
+}
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -23,6 +38,55 @@ app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Shoply Notifications' });
+});
+
+// GET /catalog/:shopId.csv
+// Flux catalogue produits au format CSV, compatible avec Facebook/Instagram
+// Commerce Manager et TikTok Catalog Manager. URL publique, à soumettre par
+// le vendeur dans son gestionnaire de catalogue (rafraîchissement automatique
+// périodique par la plateforme — toujours à jour car généré en direct depuis
+// Firestore à chaque requête, pas un export statique figé).
+app.get('/catalog/:shopId.csv', async (req, res) => {
+  const { shopId } = req.params;
+
+  try {
+    const shopSnap = await db.collection('shops').doc(shopId).get();
+    if (!shopSnap.exists) return res.status(404).send('Boutique introuvable');
+    const shop = shopSnap.data();
+
+    const productsSnap = await db.collection('products')
+      .where('shopId', '==', shopId)
+      .where('isActive', '==', true)
+      .get();
+
+    const escapeCsv = (val) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+
+    const header = ['id', 'title', 'description', 'availability', 'condition', 'price', 'link', 'image_link', 'brand'];
+    const rows = productsSnap.docs.map((doc) => {
+      const p = doc.data();
+      const link = `${SITE_BASE_URL}/product/${getProductSlug(p)}/`;
+      return [
+        p.id,
+        p.name,
+        p.description || p.name,
+        p.stock > 0 ? 'in stock' : 'out of stock',
+        'new',
+        `${Math.round(p.price)} XOF`,
+        link,
+        p.images?.[0] || '',
+        shop.name,
+      ].map(escapeCsv).join(',');
+    });
+
+    const csv = [header.join(','), ...rows].join('\n');
+
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=1800');
+    res.send(csv);
+  } catch (err) {
+    console.error('Catalog feed error:', err);
+    res.status(500).send('Erreur lors de la génération du catalogue');
+  }
 });
 
 // Verify Firebase ID token sent as "Authorization: Bearer <token>"
@@ -276,7 +340,20 @@ app.post('/create-paid-order', async (req, res) => {
       orderData.deliveryStatus = 'assigned';
     }
 
-    await orderRef.set(orderData);
+    // Décrémente le stock de chaque produit en même temps que la création de
+    // la commande (transaction), pour rester cohérent avec le flux client
+    // (lib/firestore.ts createOrder) — le stock ne descend jamais sous 0.
+    await db.runTransaction(async (tx) => {
+      const productRefs = items.map(it => db.collection('products').doc(it.productId));
+      const productSnaps = await Promise.all(productRefs.map(r => tx.get(r)));
+      productSnaps.forEach((snap, i) => {
+        if (!snap.exists) return;
+        const currentStock = snap.data().stock ?? 0;
+        const nextStock = Math.max(0, currentStock - items[i].quantity);
+        tx.update(productRefs[i], { stock: nextStock, updatedAt: now });
+      });
+      tx.set(orderRef, orderData);
+    });
 
     if (agent) {
       if (agent.fcmToken) {
@@ -432,6 +509,67 @@ app.post('/resend-delivery-notification', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('resend-delivery-notification error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ── API publique en lecture (clé API par boutique) ─────────────────────
+// Limite de débit en mémoire, par boutique, selon son plan. Suffisant pour
+// une seule instance Render — pas de store partagé (Redis) à ce stade.
+const API_RATE_LIMITS = { free: 30, premium: 60, business: 300 }; // requêtes/minute
+const apiRateLimitState = new Map(); // shopId -> { count, windowStart }
+
+async function authenticateApiKey(req, res, next) {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  if (!apiKey) return res.status(401).json({ error: 'Clé API manquante (en-tête x-api-key)' });
+
+  try {
+    const snap = await db.collection('shops').where('apiKey', '==', apiKey).limit(1).get();
+    if (snap.empty) return res.status(401).json({ error: 'Clé API invalide' });
+    const shop = snap.docs[0].data();
+    if (shop.suspended) return res.status(403).json({ error: 'Boutique suspendue' });
+
+    const limit = API_RATE_LIMITS[shop.plan] || API_RATE_LIMITS.free;
+    const now = Date.now();
+    const state = apiRateLimitState.get(shop.id) || { count: 0, windowStart: now };
+    if (now - state.windowStart > 60_000) {
+      state.count = 0;
+      state.windowStart = now;
+    }
+    state.count += 1;
+    apiRateLimitState.set(shop.id, state);
+    res.set('X-RateLimit-Limit', String(limit));
+    res.set('X-RateLimit-Remaining', String(Math.max(0, limit - state.count)));
+    if (state.count > limit) {
+      return res.status(429).json({ error: `Limite de ${limit} requêtes/minute dépassée pour le plan ${shop.plan}` });
+    }
+
+    req.apiShop = shop;
+    next();
+  } catch (err) {
+    console.error('API auth error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+}
+
+// GET /api/v1/products — liste des produits de la boutique propriétaire de la clé
+app.get('/api/v1/products', authenticateApiKey, async (req, res) => {
+  try {
+    const snap = await db.collection('products').where('shopId', '==', req.apiShop.id).get();
+    res.json({ data: snap.docs.map((d) => d.data()) });
+  } catch (err) {
+    console.error('API products error:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET /api/v1/orders — liste des commandes de la boutique propriétaire de la clé
+app.get('/api/v1/orders', authenticateApiKey, async (req, res) => {
+  try {
+    const snap = await db.collection('orders').where('shopId', '==', req.apiShop.id).get();
+    res.json({ data: snap.docs.map((d) => d.data()) });
+  } catch (err) {
+    console.error('API orders error:', err);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
